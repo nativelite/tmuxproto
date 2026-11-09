@@ -95,6 +95,14 @@ pub enum Verb {
         command: Option<String>,
         /// `-d`: the new pane does not take focus. Claude Code passes it.
         detached: bool,
+        /// `-t`: the pane to split (`%N`), or the window (`@0`), which means
+        /// "beside the caller". Claude Code's first teammate targets `@0`;
+        /// each later one targets an existing teammate's pane.
+        target: Option<Target>,
+        /// `-l`: the new pane's size as tmux writes it (`70%`, or `20` cells),
+        /// handed to the host raw. A host whose layout cannot honour it
+        /// ignores it; the split still happens.
+        size: Option<String>,
     },
     NewWindow {
         name: Option<String>,
@@ -235,6 +243,8 @@ pub fn parse(args: &[String]) -> Verb {
             print: has("-P").then(|| opt("-F").unwrap_or_else(|| "#{pane_id}".to_string())),
             command,
             detached: has("-d"),
+            target,
+            size: opt("-l"),
         },
         "new-window" | "neww" => Verb::NewWindow {
             name: opt("-n"),
@@ -417,13 +427,19 @@ pub trait Broker {
     fn caller(&self) -> Option<usize>;
     /// Every pane the caller may see, as `(id, parent, role, title)`.
     fn list(&mut self) -> Result<Vec<Node>, String>;
-    /// `here`: tiled beside the caller; else a new window. `focus`: whether
-    /// the new pane takes the keyboard (false for tmux's `-d`, which Claude
-    /// Code passes so the lead's human keeps their place). Returns the new id.
+    /// `here`: tiled in the caller's window; else a new window. `focus`:
+    /// whether the new pane takes the keyboard (false for tmux's `-d`, which
+    /// Claude Code passes so the lead's human keeps their place). `beside`:
+    /// the pane the split targeted (`-t %N`), to place the new pane next to;
+    /// `None` (a window target, or no `-t`) means beside the caller. `size`:
+    /// the raw `-l` value (`70%`, `20`), which a host honours when its layout
+    /// can and otherwise ignores. Returns the new id.
     fn spawn(
         &mut self,
         here: bool,
         focus: bool,
+        beside: Option<usize>,
+        size: Option<&str>,
         role: Option<&str>,
         argv: &[String],
     ) -> Result<usize, String>;
@@ -480,12 +496,21 @@ fn view_of(host: Host, broker: &mut dyn Broker) -> Result<View, String> {
     })
 }
 
+/// What a `split-window` or `new-window` asks of the broker, besides the
+/// command: where the pane goes and whether it takes the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement<'a> {
+    here: bool,
+    focus: bool,
+    beside: Option<usize>,
+    size: Option<&'a str>,
+    name: Option<&'a str>,
+}
+
 fn spawn_from(
     host: Host,
     broker: &mut dyn Broker,
-    here: bool,
-    focus: bool,
-    name: Option<&str>,
+    place: Placement<'_>,
     command: Option<&str>,
     print: Option<&str>,
     verb: &str,
@@ -499,8 +524,15 @@ fn spawn_from(
     if argv.is_empty() {
         return Outcome::err(format!("{verb}: empty command"));
     }
-    let role = name.map(str::to_string).or_else(|| agent_name(&argv));
-    let id = match broker.spawn(here, focus, role.as_deref(), &argv) {
+    let role = place.name.map(str::to_string).or_else(|| agent_name(&argv));
+    let id = match broker.spawn(
+        place.here,
+        place.focus,
+        place.beside,
+        place.size,
+        role.as_deref(),
+        &argv,
+    ) {
         Ok(id) => id,
         Err(e) => return Outcome::err(format!("{verb}: {e}")),
     };
@@ -559,12 +591,23 @@ pub fn run(verb: Verb, broker: &mut dyn Broker, host: Host) -> Outcome {
             print,
             command,
             detached,
+            target,
+            size,
         } => spawn_from(
             host,
             broker,
-            true,
-            !detached,
-            None,
+            Placement {
+                here: true,
+                focus: !detached,
+                // `-t %N` names the pane to sit beside; `-t @0` (or none) is
+                // the window, which for one window means the caller.
+                beside: match target {
+                    Some(Target::Pane(id)) => Some(id),
+                    _ => None,
+                },
+                size: size.as_deref(),
+                name: None,
+            },
             command.as_deref(),
             print.as_deref(),
             "split-window",
@@ -577,9 +620,13 @@ pub fn run(verb: Verb, broker: &mut dyn Broker, host: Host) -> Outcome {
         } => spawn_from(
             host,
             broker,
-            false,
-            !detached,
-            name.as_deref(),
+            Placement {
+                here: false,
+                focus: !detached,
+                beside: None,
+                size: None,
+                name: name.as_deref(),
+            },
             command.as_deref(),
             print.as_deref(),
             "new-window",
@@ -618,7 +665,15 @@ impl Broker for NoBroker {
     fn list(&mut self) -> Result<Vec<Node>, String> {
         Ok(Vec::new())
     }
-    fn spawn(&mut self, _: bool, _: bool, _: Option<&str>, _: &[String]) -> Result<usize, String> {
+    fn spawn(
+        &mut self,
+        _: bool,
+        _: bool,
+        _: Option<usize>,
+        _: Option<&str>,
+        _: Option<&str>,
+        _: &[String],
+    ) -> Result<usize, String> {
         Err("no session".to_string())
     }
     fn kill(&mut self, _: usize) -> Result<(), String> {
@@ -652,11 +707,22 @@ mod tests {
             .collect()
     }
 
+    /// One `Broker::spawn` call as the fake saw it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Spawned {
+        here: bool,
+        focus: bool,
+        beside: Option<usize>,
+        size: Option<String>,
+        role: Option<String>,
+        argv: Vec<String>,
+    }
+
     #[derive(Default)]
     struct Fake {
         caller: Option<usize>,
         nodes: Vec<Node>,
-        spawned: Vec<(bool, bool, Option<String>, Vec<String>)>,
+        spawned: Vec<Spawned>,
         killed: Vec<usize>,
         sent: Vec<(usize, String)>,
         next: usize,
@@ -672,11 +738,19 @@ mod tests {
             &mut self,
             here: bool,
             focus: bool,
+            beside: Option<usize>,
+            size: Option<&str>,
             role: Option<&str>,
             argv: &[String],
         ) -> Result<usize, String> {
-            self.spawned
-                .push((here, focus, role.map(str::to_string), argv.to_vec()));
+            self.spawned.push(Spawned {
+                here,
+                focus,
+                beside,
+                size: size.map(str::to_string),
+                role: role.map(str::to_string),
+                argv: argv.to_vec(),
+            });
             self.next += 1;
             let id = 100 + self.next;
             self.nodes
@@ -733,6 +807,8 @@ mod tests {
             print,
             command,
             detached,
+            target,
+            size,
         } = &v
         else {
             panic!("{v:?}");
@@ -740,15 +816,46 @@ mod tests {
         assert!(detached, "-d is what Claude Code passes");
         assert_eq!(print.as_deref(), Some("#{pane_id}"));
         assert!(command.as_deref().unwrap().starts_with("claude --agent-id"));
+        assert_eq!(*target, Some(Target::Window), "-t @0 is the window");
+        assert_eq!(size.as_deref(), Some("70%"), "-l is carried raw");
         let mut b = team();
         let out = run(v.clone(), &mut b, HOST);
         assert_eq!(out.code, 0, "{}", out.stderr);
         assert_eq!(out.stdout, "%101\n");
-        let (here, focus, role, argv) = &b.spawned[0];
-        assert!(here);
-        assert!(!focus, "-d: the lead's human keeps the keyboard");
-        assert_eq!(role.as_deref(), Some("researcher"));
-        assert_eq!(argv[0], "claude");
+        let s = &b.spawned[0];
+        assert!(s.here);
+        assert!(!s.focus, "-d: the lead's human keeps the keyboard");
+        assert_eq!(s.beside, None, "a window target means beside the caller");
+        assert_eq!(s.size.as_deref(), Some("70%"));
+        assert_eq!(s.role.as_deref(), Some("researcher"));
+        assert_eq!(s.argv[0], "claude");
+    }
+
+    #[test]
+    fn a_later_teammate_splits_the_pane_it_targets() {
+        // Claude Code's second and later teammates target an existing
+        // teammate's pane, alternating -v and -h, with no -l.
+        let v = parse(&a(
+            "split-window -d -t %4 -v -P -F #{pane_id} -- claude --agent-name dev",
+        ));
+        let Verb::SplitWindow { target, size, .. } = &v else {
+            panic!("{v:?}");
+        };
+        assert_eq!(*target, Some(Target::Pane(4)));
+        assert_eq!(*size, None);
+        let mut b = team();
+        let out = run(v, &mut b, HOST);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, "%101\n");
+        let s = &b.spawned[0];
+        assert!(s.here);
+        assert_eq!(s.beside, Some(4), "-t %4 places the new pane beside pane 4");
+        assert_eq!(s.size, None);
+        // A size in cells is handed over as written too.
+        let v = parse(&a("split-window -t %4 -h -l 20 -- claude"));
+        run(v, &mut b, HOST);
+        assert_eq!(b.spawned[1].size.as_deref(), Some("20"));
+        assert!(b.spawned[1].focus, "no -d: the new pane takes focus");
     }
 
     #[test]
@@ -847,9 +954,10 @@ mod tests {
             HOST,
         );
         assert_eq!(out.stdout, "%101\n");
-        let (here, focus, role, _) = &b.spawned[0];
-        assert!(!here);
-        assert!(focus, "no -d: the new window takes focus");
-        assert_eq!(role.as_deref(), Some("worker"));
+        let s = &b.spawned[0];
+        assert!(!s.here);
+        assert!(s.focus, "no -d: the new window takes focus");
+        assert_eq!(s.beside, None);
+        assert_eq!(s.role.as_deref(), Some("worker"));
     }
 }

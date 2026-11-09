@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-08
+
+### Changed
+- **`split-window` carries its `-t` target and `-l` size; `Broker::spawn`
+  takes `beside: Option<usize>` and `size: Option<&str>`.** Claude Code's
+  first teammate splits the window (`-t @0 -h -l 70%`) and each later one
+  splits an existing teammate's pane (`-t %N -v|-h`); the shim parsed `-t`
+  and dropped it for `split-window`, so a host could only ever place the new
+  pane beside the caller (atrium issue #17). `Verb::SplitWindow` now has
+  `target: Option<Target>` and `size: Option<String>` (the raw `-l` value);
+  `run` passes `beside = Some(N)` for `-t %N` and `None` for a window target
+  or no target, and `size` as written. A host honours `size` when its layout
+  can and ignores it otherwise. Breaking for a `Broker` implementation (two
+  added parameters) and for a match on `Verb::SplitWindow`; nothing else
+  changes.
+
 ## [0.2.0] - 2026-11-08
 
 ### Changed

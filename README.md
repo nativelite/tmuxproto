@@ -25,7 +25,7 @@ the verbs served. This crate is the half of that every host shares, so
 
 ```toml
 [dependencies]
-tmuxproto = { package = "nativelite-tmuxproto", version = "0.1" }
+tmuxproto = { package = "nativelite-tmuxproto", version = "0.3" }
 ```
 
 ## Use
@@ -41,8 +41,16 @@ struct Panes; // your backend
 impl Broker for Panes {
     fn caller(&self) -> Option<usize> { std::env::var("MYTERM_PANE").ok()?.parse().ok() }
     fn list(&mut self) -> Result<Vec<Node>, String> { Ok(vec![(1, None, None, "claude".into())]) }
-    fn spawn(&mut self, here: bool, focus: bool, role: Option<&str>, argv: &[String]) -> Result<usize, String> {
-        let _ = (here, focus, role, argv); // focus is false for tmux's -d
+    fn spawn(
+        &mut self,
+        here: bool,            // split the caller's window, or open a new one
+        focus: bool,           // false for tmux's -d
+        beside: Option<usize>, // the pane `-t %N` targeted; None = beside the caller
+        size: Option<&str>,    // the raw `-l` value ("70%", "20"), if your layout can use it
+        role: Option<&str>,
+        argv: &[String],
+    ) -> Result<usize, String> {
+        let _ = (here, focus, beside, size, role, argv);
         Ok(2) // open the pane, return its id
     }
     fn kill(&mut self, _id: usize) -> Result<(), String> { Ok(()) }
@@ -85,8 +93,8 @@ Read from the installed Claude Code 2.1.289:
 | `-V` | version line |
 | `display-message -p [-t] <fmt>` | expands `#{pane_id}`, `#{window_id}`, `#{pane_title}`, `#{pane_index}`, `#{window_panes}`, `#{window_name}`, `#{session_name}`, `#{session_id}`, `#{client_control_mode}`; unknown variables expand to nothing |
 | `list-panes -F`, `list-windows -F` | the caller and its direct children; one window |
-| `split-window [-d] … -P -F <fmt> -- <cmd>` | `Broker::spawn(here = true, focus = !detached)`, role from `--agent-name`; the command is split with `sh_words` so no shell is needed. Claude Code passes `-d`, so the lead's human keeps the keyboard |
-| `new-window [-d] -n <name> … -- <cmd>` | `Broker::spawn(here = false, focus = !detached)` |
+| `split-window [-d] [-t <target>] [-h\|-v] [-l <size>] … -P -F <fmt> -- <cmd>` | `Broker::spawn(here = true, focus = !detached, beside, size)`, role from `--agent-name`; the command is split with `sh_words` so no shell is needed. Claude Code passes `-d`, so the lead's human keeps the keyboard. `-t %N` is `beside = Some(N)`: the host places the new pane next to that pane (Claude Code's second and later teammates target an existing teammate); `-t @0` or no `-t` is `beside = None`, next to the caller. `-l` is parsed and handed to the host raw (`"70%"`, `"20"`); a host whose layout is equal-size (atrium's grid is) ignores it, and the split still happens. `-h`/`-v` are accepted; the host's own layout decides the orientation |
+| `new-window [-d] -n <name> … -- <cmd>` | `Broker::spawn(here = false, focus = !detached, beside = None, size = None)` |
 | `kill-pane -t %N` | `Broker::kill` |
 | `send-keys -t %N <keys…> [Enter]` | `Broker::send` |
 | `set-option`, `select-pane`, `select-layout`, `resize-pane`, `show-environment`, `has-session`, `new-session`, `switch-client`, `attach-session` | accepted, exit 0, no output |
