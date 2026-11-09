@@ -1,0 +1,17 @@
+[package]
+name = "nativelite-tmuxproto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "The tmux command-line protocol a pane host needs to serve Claude Code's agent teams: argv parsing, #{format} expansion, POSIX shell words, and the verb runner over your own pane backend. Standard library only."
+license = "MIT"
+repository = "https://github.com/nativelite/tmuxproto"
+keywords = ["tmux", "terminal", "agents", "claude", "nativelite"]
+categories = ["command-line-interface", "parser-implementations"]
+
+# nativelite core rule: ZERO third-party dependencies. Do not add to this.
+[dependencies]
+
+[lib]
+name = "tmuxproto"
+path = "src/lib.rs"
