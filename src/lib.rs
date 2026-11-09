@@ -93,11 +93,15 @@ pub enum Verb {
     SplitWindow {
         print: Option<String>,
         command: Option<String>,
+        /// `-d`: the new pane does not take focus. Claude Code passes it.
+        detached: bool,
     },
     NewWindow {
         name: Option<String>,
         print: Option<String>,
         command: Option<String>,
+        /// `-d`: the new window does not take focus.
+        detached: bool,
     },
     KillPane {
         target: Target,
@@ -230,11 +234,13 @@ pub fn parse(args: &[String]) -> Verb {
         "split-window" | "splitw" => Verb::SplitWindow {
             print: has("-P").then(|| opt("-F").unwrap_or_else(|| "#{pane_id}".to_string())),
             command,
+            detached: has("-d"),
         },
         "new-window" | "neww" => Verb::NewWindow {
             name: opt("-n"),
             print: has("-P").then(|| opt("-F").unwrap_or_else(|| "#{pane_id}".to_string())),
             command,
+            detached: has("-d"),
         },
         "kill-pane" | "killp" => match target {
             Some(t) => Verb::KillPane { target: t },
@@ -411,8 +417,16 @@ pub trait Broker {
     fn caller(&self) -> Option<usize>;
     /// Every pane the caller may see, as `(id, parent, role, title)`.
     fn list(&mut self) -> Result<Vec<Node>, String>;
-    /// `here`: tiled beside the caller; else a new window. Returns the new id.
-    fn spawn(&mut self, here: bool, role: Option<&str>, argv: &[String]) -> Result<usize, String>;
+    /// `here`: tiled beside the caller; else a new window. `focus`: whether
+    /// the new pane takes the keyboard (false for tmux's `-d`, which Claude
+    /// Code passes so the lead's human keeps their place). Returns the new id.
+    fn spawn(
+        &mut self,
+        here: bool,
+        focus: bool,
+        role: Option<&str>,
+        argv: &[String],
+    ) -> Result<usize, String>;
     fn kill(&mut self, id: usize) -> Result<(), String>;
     fn send(&mut self, id: usize, text: &str) -> Result<(), String>;
 }
@@ -470,6 +484,7 @@ fn spawn_from(
     host: Host,
     broker: &mut dyn Broker,
     here: bool,
+    focus: bool,
     name: Option<&str>,
     command: Option<&str>,
     print: Option<&str>,
@@ -485,7 +500,7 @@ fn spawn_from(
         return Outcome::err(format!("{verb}: empty command"));
     }
     let role = name.map(str::to_string).or_else(|| agent_name(&argv));
-    let id = match broker.spawn(here, role.as_deref(), &argv) {
+    let id = match broker.spawn(here, focus, role.as_deref(), &argv) {
         Ok(id) => id,
         Err(e) => return Outcome::err(format!("{verb}: {e}")),
     };
@@ -540,10 +555,15 @@ pub fn run(verb: Verb, broker: &mut dyn Broker, host: Host) -> Outcome {
             };
             Outcome::ok(format!("{}\n", expand(&fmt, view.caller_pane(), &view)))
         }
-        Verb::SplitWindow { print, command } => spawn_from(
+        Verb::SplitWindow {
+            print,
+            command,
+            detached,
+        } => spawn_from(
             host,
             broker,
             true,
+            !detached,
             None,
             command.as_deref(),
             print.as_deref(),
@@ -553,10 +573,12 @@ pub fn run(verb: Verb, broker: &mut dyn Broker, host: Host) -> Outcome {
             name,
             print,
             command,
+            detached,
         } => spawn_from(
             host,
             broker,
             false,
+            !detached,
             name.as_deref(),
             command.as_deref(),
             print.as_deref(),
@@ -596,7 +618,7 @@ impl Broker for NoBroker {
     fn list(&mut self) -> Result<Vec<Node>, String> {
         Ok(Vec::new())
     }
-    fn spawn(&mut self, _: bool, _: Option<&str>, _: &[String]) -> Result<usize, String> {
+    fn spawn(&mut self, _: bool, _: bool, _: Option<&str>, _: &[String]) -> Result<usize, String> {
         Err("no session".to_string())
     }
     fn kill(&mut self, _: usize) -> Result<(), String> {
@@ -634,7 +656,7 @@ mod tests {
     struct Fake {
         caller: Option<usize>,
         nodes: Vec<Node>,
-        spawned: Vec<(bool, Option<String>, Vec<String>)>,
+        spawned: Vec<(bool, bool, Option<String>, Vec<String>)>,
         killed: Vec<usize>,
         sent: Vec<(usize, String)>,
         next: usize,
@@ -649,11 +671,12 @@ mod tests {
         fn spawn(
             &mut self,
             here: bool,
+            focus: bool,
             role: Option<&str>,
             argv: &[String],
         ) -> Result<usize, String> {
             self.spawned
-                .push((here, role.map(str::to_string), argv.to_vec()));
+                .push((here, focus, role.map(str::to_string), argv.to_vec()));
             self.next += 1;
             let id = 100 + self.next;
             self.nodes
@@ -706,17 +729,24 @@ mod tests {
         let v = parse(&a(
             "split-window -d -t @0 -h -l 70% -P -F #{pane_id} -- claude --agent-id abc --agent-name researcher --team-name t1",
         ));
-        let Verb::SplitWindow { print, command } = &v else {
+        let Verb::SplitWindow {
+            print,
+            command,
+            detached,
+        } = &v
+        else {
             panic!("{v:?}");
         };
+        assert!(detached, "-d is what Claude Code passes");
         assert_eq!(print.as_deref(), Some("#{pane_id}"));
         assert!(command.as_deref().unwrap().starts_with("claude --agent-id"));
         let mut b = team();
         let out = run(v.clone(), &mut b, HOST);
         assert_eq!(out.code, 0, "{}", out.stderr);
         assert_eq!(out.stdout, "%101\n");
-        let (here, role, argv) = &b.spawned[0];
+        let (here, focus, role, argv) = &b.spawned[0];
         assert!(here);
+        assert!(!focus, "-d: the lead's human keeps the keyboard");
         assert_eq!(role.as_deref(), Some("researcher"));
         assert_eq!(argv[0], "claude");
     }
@@ -817,8 +847,9 @@ mod tests {
             HOST,
         );
         assert_eq!(out.stdout, "%101\n");
-        let (here, role, _) = &b.spawned[0];
+        let (here, focus, role, _) = &b.spawned[0];
         assert!(!here);
+        assert!(focus, "no -d: the new window takes focus");
         assert_eq!(role.as_deref(), Some("worker"));
     }
 }

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
+### Changed
+- **`Broker::spawn` takes `focus: bool`, and `Verb::SplitWindow` /
+  `Verb::NewWindow` carry `detached`.** tmux's `-d` means the new pane does
+  not take focus, and Claude Code passes it on every teammate spawn; a host
+  that focused the new pane moved the lead's human into the teammate. Breaking
+  for a `Broker` implementation (one added parameter); nothing else changes.
+
+## [0.1.0] - 2026-11-08
+
 ### Added
 - First cut, moved out of atrium 0.42.0's `src/tmux_shim.rs` so atrium and
   fwterm serve Claude Code's agent teams from one parser: `parse` (the tmux

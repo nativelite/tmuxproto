@@ -1,6 +1,6 @@
 [package]
 name = "nativelite-tmuxproto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
 description = "The tmux command-line protocol a pane host needs to serve Claude Code's agent teams: argv parsing, #{format} expansion, POSIX shell words, and the verb runner over your own pane backend. Standard library only."

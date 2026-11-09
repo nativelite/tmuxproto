@@ -41,8 +41,8 @@ struct Panes; // your backend
 impl Broker for Panes {
     fn caller(&self) -> Option<usize> { std::env::var("MYTERM_PANE").ok()?.parse().ok() }
     fn list(&mut self) -> Result<Vec<Node>, String> { Ok(vec![(1, None, None, "claude".into())]) }
-    fn spawn(&mut self, here: bool, role: Option<&str>, argv: &[String]) -> Result<usize, String> {
-        let _ = (here, role, argv);
+    fn spawn(&mut self, here: bool, focus: bool, role: Option<&str>, argv: &[String]) -> Result<usize, String> {
+        let _ = (here, focus, role, argv); // focus is false for tmux's -d
         Ok(2) // open the pane, return its id
     }
     fn kill(&mut self, _id: usize) -> Result<(), String> { Ok(()) }
@@ -85,8 +85,8 @@ Read from the installed Claude Code 2.1.289:
 | `-V` | version line |
 | `display-message -p [-t] <fmt>` | expands `#{pane_id}`, `#{window_id}`, `#{pane_title}`, `#{pane_index}`, `#{window_panes}`, `#{window_name}`, `#{session_name}`, `#{session_id}`, `#{client_control_mode}`; unknown variables expand to nothing |
 | `list-panes -F`, `list-windows -F` | the caller and its direct children; one window |
-| `split-window … -P -F <fmt> -- <cmd>` | `Broker::spawn(here = true)`, role from `--agent-name`; the command is split with `sh_words` so no shell is needed |
-| `new-window -n <name> … -- <cmd>` | `Broker::spawn(here = false)` |
+| `split-window [-d] … -P -F <fmt> -- <cmd>` | `Broker::spawn(here = true, focus = !detached)`, role from `--agent-name`; the command is split with `sh_words` so no shell is needed. Claude Code passes `-d`, so the lead's human keeps the keyboard |
+| `new-window [-d] -n <name> … -- <cmd>` | `Broker::spawn(here = false, focus = !detached)` |
 | `kill-pane -t %N` | `Broker::kill` |
 | `send-keys -t %N <keys…> [Enter]` | `Broker::send` |
 | `set-option`, `select-pane`, `select-layout`, `resize-pane`, `show-environment`, `has-session`, `new-session`, `switch-client`, `attach-session` | accepted, exit 0, no output |
