@@ -30,9 +30,13 @@
 /// teammate's process itself.
 pub const CGROUP_PREFIX: &str = r#"sh -c '{ echo $PPID > "$1"/cgroup.procs; } 2>/dev/null' sh "#;
 
-/// The longest command string parsed. The real one is a few kilobytes (its
-/// environment list is long); this bounds what a caller can make a host read.
-pub const MAX_COMMAND_BYTES: usize = 256 * 1024;
+/// The longest command string parsed: 24 KiB. The real one is a few
+/// kilobytes (its environment list is long). The bound is set so that a
+/// line of this size still fits a host's request once it is JSON-escaped
+/// (atrium's control channel carries 64 KiB a request, and a line of
+/// Windows paths doubles its backslashes), so an oversized line is refused
+/// here, with this crate's reason, and not by a transport underneath.
+pub const MAX_COMMAND_BYTES: usize = 24 * 1024;
 
 /// A teammate command, taken apart: where it runs, the environment
 /// assignments in the order written, and the program with its arguments.

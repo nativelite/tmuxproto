@@ -34,7 +34,7 @@ the verbs served. This crate is the half of that every host shares, so
 
 ```toml
 [dependencies]
-tmuxproto = { package = "nativelite-tmuxproto", version = "0.3.1" }
+tmuxproto = { package = "nativelite-tmuxproto", version = "0.4" }
 ```
 
 ## Use
@@ -108,7 +108,7 @@ What a host must match so a Claude Code lead can move between hosts:
 
 Read from two installed Claude Code releases, 2.1.289 and 2.1.325 (the code
 embedded in each binary; the crate's tests carry the 2.1.325 strings as
-fixtures):
+fixtures). `Verb` is `#[non_exhaustive]`: match it with a wildcard arm.
 
 | verb | does |
 | --- | --- |
@@ -118,7 +118,7 @@ fixtures):
 | `split-window [-d] [-t <target>] [-h\|-v] [-l <size>] … -P -F <fmt> -- <cmd>` | `Broker::spawn(here = true, focus = !detached, beside, size)`, role from `--agent-name`; the command is split with `sh_words` so no shell is needed. Claude Code passes `-d`, so the lead's human keeps the keyboard. `-t %N` is `beside = Some(N)`: the host places the new pane next to that pane (Claude Code's second and later teammates target an existing teammate); `-t @0` or no `-t` is `beside = None`, next to the caller. `-l` is parsed and handed to the host raw (`"70%"`, `"20"`): the new pane's share of the target pane, or a count of cells. atrium honours it as `ctl spawn --here --size`, keeping the ratio on its split tree through later spawns and resizes; a host whose layout is equal-size may ignore it, and a value the host refuses is dropped so the split still happens. `-h`/`-v` are accepted; the host's own layout decides the orientation |
 | `split-window … -- cat` | Claude Code 2.1.325's placeholder: a split whose whole command is the word `cat` (`PLACEHOLDER`) is `Broker::hold(focus, beside, size)`, placed like any split. The default `hold` asks `spawn` for `["cat"]`, as a host that predates it did |
 | `new-window [-d] -n <name> … -- <cmd>` | `Broker::spawn(here = false, focus = !detached, beside = None, size = None)` |
-| `respawn-pane [-k] -t %N -- <command string>` | `Broker::respawn(id, command)`, with the command line untouched: exactly one argument after `--`, and a pane target. The default `respawn` refuses |
+| `respawn-pane [-k] -t %N -- <command string>` | `Broker::respawn(id, command)`, with the command line untouched: exactly one argument after `--`, and a pane target. tmux's `-c <dir>` and `-e VAR=val` are refused, not ignored. The default `respawn` refuses |
 | `kill-pane -t %N` | `Broker::kill` |
 | `send-keys -t %N <keys…> [Enter]` | `Broker::send` |
 | `set-option`, `select-pane`, `select-layout`, `resize-pane`, `show-environment`, `has-session`, `new-session`, `switch-client`, `attach-session` | accepted, exit 0, no output |
@@ -164,6 +164,8 @@ cd <word> && env <NAME=word>* <word>+
   or backquote inside double quotes is an error too.
 - Any control character, a newline and a tab included, is an error wherever it
   is (Claude Code refuses to send one).
+- A line over `MAX_COMMAND_BYTES` (24 KiB) is an error: the bound leaves room
+  for a host to carry the line in one request.
 - An option to `cd` or to `env`, an assignment whose name is not a variable
   name, or no program after `env`: errors.
 - After `env`, a word with `=` in it is an assignment until the first word

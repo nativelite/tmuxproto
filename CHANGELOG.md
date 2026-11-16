@@ -7,14 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-11-15
+## [0.4.0] - 2026-11-16
 
 ### Added
 - **Claude Code 2.1.325's teammate launch is served.** That release no longer
   passes the teammate's command on the split. It splits with the placeholder
   `cat`, styles the pane, then sends
   `respawn-pane -k -t %N -- '<one shell command line>'`. Read from the
-  installed 2.1.325 binary; no live lead was run against this crate.
+  installed 2.1.325 binary, and since run once against atrium by a live
+  2.1.325 lead on Windows (one teammate, started and bound).
   - `Verb::RespawnPane { target, kill, command }`, parsed from
     `respawn-pane` / `respawnp` (a pane target and exactly one argument after
     `--`), and `Broker::respawn(id, command)`, which gets the command line
@@ -31,14 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     error with a reason for anything a shell would act on outside a quote
     (`;`, `|`, `&`, `$`, a backquote, `(`, `)`, `<`, `>`, `*`, `?`, `[`, `{`,
     `~`, `#`, `!`, a second `&&`), for any control character, and for input
-    over `MAX_COMMAND_BYTES`.
+    over `MAX_COMMAND_BYTES` (24 KiB, so the line fits one host request).
+  - `respawn-pane` given tmux's `-c <dir>` or `-e VAR=val` is refused with
+    a reason rather than served with the option ignored.
 - Tests pin the 2.1.325 strings as fixtures, `-S <socket>` / `-L <name>`
   before every verb, and `set-option -p -t %N remain-on-exit failed` among the
   accepted no-ops.
 
-A `match` on `Verb` with no wildcard arm needs one for `RespawnPane`. The
-version stays on 0.3 so that a host taking the crate by path under a `0.3`
-requirement keeps building.
+### Changed
+- **Breaking: `Verb` has a new variant and is now `#[non_exhaustive]`.** A
+  `match` on it needs a wildcard arm, once; the next verb this crate learns
+  will then not be a breaking change. A `Broker` implementation compiles
+  unchanged (both new methods have defaults).
 
 ## [0.3.0] - 2026-11-08
 

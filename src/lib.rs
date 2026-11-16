@@ -97,7 +97,11 @@ pub fn parse_target(s: &str) -> Target {
 }
 
 /// A parsed tmux command line.
+///
+/// Not exhaustive: a later Claude Code release may use a verb this crate
+/// then learns, so a `match` on it needs a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Verb {
     Version,
     DisplayMessage {
@@ -289,6 +293,15 @@ pub fn parse(args: &[String]) -> Verb {
         },
         "respawn-pane" | "respawnp" => match (target, positional.as_slice()) {
             (None, _) => Verb::Unsupported("respawn-pane: needs -t <pane>".to_string()),
+            // tmux's own `-c <dir>` and `-e VAR=val` would set the new
+            // process's directory and environment from outside the
+            // command line. Claude Code sends neither; accepting and
+            // ignoring them would be a silent difference, so: refused.
+            (Some(_), _) if has("-c") || has("-e") => Verb::Unsupported(
+                "respawn-pane: -c and -e are not served (the directory and the \
+                 environment are read from the command line itself)"
+                    .to_string(),
+            ),
             // tmux runs one argument as a shell command line and several as
             // an argv; Claude Code sends one, and only that form is served.
             (Some(t), [command]) => Verb::RespawnPane {
@@ -1199,6 +1212,17 @@ mod tests {
             a("respawn-pane -k -- cat"),
             a("respawn-pane -k -t %201"),
             a("respawn-pane -k -t %201 -- claude --agent-id x"),
+            // tmux's own directory and environment options.
+            {
+                let mut v = a("respawn-pane -k -c /tmp -t %201 --");
+                v.push(TEAMMATE.to_string());
+                v
+            },
+            {
+                let mut v = a("respawn-pane -k -e ANTHROPIC_BASE_URL=http://x -t %201 --");
+                v.push(TEAMMATE.to_string());
+                v
+            },
             respawn_args("@0", TEAMMATE),
         ] {
             let out = run(parse(&args), &mut b, HOST);
