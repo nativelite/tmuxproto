@@ -15,14 +15,24 @@
 //! words, and running a verb against a [`Broker`], the host's own pane backend.
 //! atrium and fwterm each implement [`Broker`]; nothing here touches a pane.
 //!
-//! The verb set is what the installed Claude Code (2.1.289) was read to use:
-//! `-V`, `display-message -p`, `list-panes -F`, `list-windows -F`,
-//! `split-window`, `new-window`, `kill-pane`, `send-keys`, and a set of layout
-//! and style verbs honoured by doing nothing (`set-option`, `select-pane`,
-//! `select-layout`, `resize-pane`, `show-environment`, `has-session`,
-//! `new-session`, `switch-client`, `attach-session`). Anything else exits 1
-//! with a message. `capture-pane` is refused on purpose: a host should never
-//! hand one pane the text of another.
+//! The verb set is what two Claude Code releases were read to use (2.1.289,
+//! then 2.1.325): `-V`, `display-message -p`, `list-panes -F`,
+//! `list-windows -F`, `split-window`, `new-window`, `respawn-pane`,
+//! `kill-pane`, `send-keys`, and a set of layout and style verbs honoured by
+//! doing nothing (`set-option`, `select-pane`, `select-layout`, `resize-pane`,
+//! `show-environment`, `has-session`, `new-session`, `switch-client`,
+//! `attach-session`). Anything else exits 1 with a message. `capture-pane` is
+//! refused on purpose: a host should never hand one pane the text of another.
+//!
+//! The two releases start a teammate differently. 2.1.289 passes the
+//! teammate's command on the split (`split-window … -- claude --agent-id …`),
+//! which reaches [`Broker::spawn`] as an argv. 2.1.325 splits with the
+//! placeholder command `cat` ([`PLACEHOLDER`], [`Broker::hold`]), styles the
+//! pane, then replaces the placeholder with
+//! `respawn-pane -k -t %N -- '<one shell command line>'`
+//! ([`Verb::RespawnPane`], [`Broker::respawn`]). That line is a POSIX shell
+//! command; [`parse_teammate_command`] takes it apart without a shell and
+//! refuses whatever is outside its one grammar.
 //!
 //! Model: one window, `@0`, named after the host. Its panes are the caller and
 //! the caller's direct children, which is the team as the lead sees it. Pane
@@ -32,6 +42,16 @@
 //! class, and `tmux -V` must report a major of 2 or more.
 //!
 //! Zero third-party dependencies: the Rust standard library only.
+
+mod teammate;
+
+pub use teammate::{parse_teammate_command, TeammateCommand, CGROUP_PREFIX, MAX_COMMAND_BYTES};
+
+/// The command Claude Code 2.1.325 splits a pane with before the teammate
+/// exists: a process that only holds the pane open until `respawn-pane`
+/// replaces it. A `split-window` whose whole command is this word asks the
+/// host for a placeholder ([`Broker::hold`]), not for a pane running `cat`.
+pub const PLACEHOLDER: &str = "cat";
 
 /// The one window every pane reports.
 pub const WINDOW_ID: &str = "@0";
@@ -114,6 +134,16 @@ pub enum Verb {
     KillPane {
         target: Target,
     },
+    /// `respawn-pane [-k] -t <pane> -- <command>`: replace what runs in a
+    /// pane. Claude Code 2.1.325 sends it once per teammate, to turn the
+    /// placeholder it split into the teammate.
+    RespawnPane {
+        target: Target,
+        /// `-k`: kill what runs there first. Claude Code always passes it.
+        kill: bool,
+        /// The one shell command line after `--`, as written.
+        command: String,
+    },
     SendKeys {
         target: Option<Target>,
         text: String,
@@ -162,6 +192,7 @@ fn valued_flags(verb: &str) -> &'static [&'static str] {
         "display-message" | "display" => &["-t", "-c", "-d", "-F"],
         "list-panes" | "lsp" | "list-windows" | "lsw" => &["-t", "-F", "-f"],
         "kill-pane" | "killp" => &["-t"],
+        "respawn-pane" | "respawnp" => &["-t", "-c", "-e"],
         "send-keys" | "send" => &["-t", "-N", "-c"],
         _ => &[],
     }
@@ -255,6 +286,19 @@ pub fn parse(args: &[String]) -> Verb {
         "kill-pane" | "killp" => match target {
             Some(t) => Verb::KillPane { target: t },
             None => Verb::Unsupported("kill-pane: needs -t <pane>".to_string()),
+        },
+        "respawn-pane" | "respawnp" => match (target, positional.as_slice()) {
+            (None, _) => Verb::Unsupported("respawn-pane: needs -t <pane>".to_string()),
+            // tmux runs one argument as a shell command line and several as
+            // an argv; Claude Code sends one, and only that form is served.
+            (Some(t), [command]) => Verb::RespawnPane {
+                target: t,
+                kill: has("-k"),
+                command: command.clone(),
+            },
+            (Some(_), _) => Verb::Unsupported(
+                "respawn-pane: needs exactly one command string after `--`".to_string(),
+            ),
         },
         "send-keys" | "send" => {
             // `send-keys -t %3 'text' Enter`: the keys are typed in order; a
@@ -445,6 +489,33 @@ pub trait Broker {
     ) -> Result<usize, String>;
     fn kill(&mut self, id: usize) -> Result<(), String>;
     fn send(&mut self, id: usize, text: &str) -> Result<(), String>;
+    /// A placeholder pane: what a `split-window … -- cat` ([`PLACEHOLDER`])
+    /// asks for. It is placed like a split (`focus`, `beside` and `size` as
+    /// for [`Broker::spawn`], tiled in the caller's window), holds its place
+    /// until [`Broker::respawn`] starts a teammate in it, and runs nothing of
+    /// the caller's. Returns the new id.
+    ///
+    /// The default asks [`Broker::spawn`] for a pane running the placeholder
+    /// word itself, which is what a host that predates the verb did.
+    fn hold(
+        &mut self,
+        focus: bool,
+        beside: Option<usize>,
+        size: Option<&str>,
+    ) -> Result<usize, String> {
+        self.spawn(true, focus, beside, size, None, &[PLACEHOLDER.to_string()])
+    }
+    /// `respawn-pane -k -t %<id> -- <command>`: start `command` in pane `id`
+    /// in place of what runs there, keeping the pane's id. `command` is the
+    /// shell command line exactly as the caller wrote it and must never
+    /// reach a shell: a host takes it apart with [`parse_teammate_command`]
+    /// and decides what of it to honour.
+    ///
+    /// The default refuses: a host has to opt in to replacing a pane.
+    fn respawn(&mut self, id: usize, command: &str) -> Result<(), String> {
+        let _ = (id, command);
+        Err("this host does not respawn panes".to_string())
+    }
 }
 
 /// What a served verb prints and how it exits.
@@ -524,15 +595,27 @@ fn spawn_from(
     if argv.is_empty() {
         return Outcome::err(format!("{verb}: empty command"));
     }
-    let role = place.name.map(str::to_string).or_else(|| agent_name(&argv));
-    let id = match broker.spawn(
-        place.here,
-        place.focus,
-        place.beside,
-        place.size,
-        role.as_deref(),
-        &argv,
-    ) {
+    // A split whose whole command is the placeholder word is Claude Code
+    // 2.1.325 reserving a pane; the teammate arrives by `respawn-pane`.
+    let hold = place.here && argv.len() == 1 && argv[0] == PLACEHOLDER;
+    let role = if hold {
+        None
+    } else {
+        place.name.map(str::to_string).or_else(|| agent_name(&argv))
+    };
+    let made = if hold {
+        broker.hold(place.focus, place.beside, place.size)
+    } else {
+        broker.spawn(
+            place.here,
+            place.focus,
+            place.beside,
+            place.size,
+            role.as_deref(),
+            &argv,
+        )
+    };
+    let id = match made {
         Ok(id) => id,
         Err(e) => return Outcome::err(format!("{verb}: {e}")),
     };
@@ -637,6 +720,17 @@ pub fn run(verb: Verb, broker: &mut dyn Broker, host: Host) -> Outcome {
                 Err(e) => Outcome::err(format!("kill-pane: {e}")),
             },
             Target::Window => Outcome::err("kill-pane: names a window, not a pane"),
+        },
+        Verb::RespawnPane {
+            target,
+            kill: _,
+            command,
+        } => match target {
+            Target::Pane(id) => match broker.respawn(id, &command) {
+                Ok(()) => Outcome::ok(String::new()),
+                Err(e) => Outcome::err(format!("respawn-pane: {e}")),
+            },
+            Target::Window => Outcome::err("respawn-pane: names a window, not a pane"),
         },
         Verb::SendKeys { target, text } => {
             let id = match target {
@@ -959,5 +1053,245 @@ mod tests {
         assert!(s.focus, "no -d: the new window takes focus");
         assert_eq!(s.beside, None);
         assert_eq!(s.role.as_deref(), Some("worker"));
+    }
+
+    // ---- Claude Code 2.1.325: placeholder, then respawn-pane ----------------
+
+    /// A host that serves the 2.1.325 sequence: it overrides `hold` and
+    /// `respawn`. Everything else is [`Fake`]'s.
+    #[derive(Default)]
+    struct Fake325 {
+        inner: Fake,
+        held: Vec<(bool, Option<usize>, Option<String>)>,
+        respawned: Vec<(usize, String)>,
+    }
+    impl Broker for Fake325 {
+        fn caller(&self) -> Option<usize> {
+            self.inner.caller
+        }
+        fn list(&mut self) -> Result<Vec<Node>, String> {
+            self.inner.list()
+        }
+        fn spawn(
+            &mut self,
+            here: bool,
+            focus: bool,
+            beside: Option<usize>,
+            size: Option<&str>,
+            role: Option<&str>,
+            argv: &[String],
+        ) -> Result<usize, String> {
+            self.inner.spawn(here, focus, beside, size, role, argv)
+        }
+        fn kill(&mut self, id: usize) -> Result<(), String> {
+            self.inner.kill(id)
+        }
+        fn send(&mut self, id: usize, text: &str) -> Result<(), String> {
+            self.inner.send(id, text)
+        }
+        fn hold(
+            &mut self,
+            focus: bool,
+            beside: Option<usize>,
+            size: Option<&str>,
+        ) -> Result<usize, String> {
+            self.held.push((focus, beside, size.map(str::to_string)));
+            let id = 200 + self.held.len();
+            self.inner
+                .nodes
+                .push((id, self.inner.caller, None, "waiting".into()));
+            Ok(id)
+        }
+        fn respawn(&mut self, id: usize, command: &str) -> Result<(), String> {
+            self.respawned.push((id, command.to_string()));
+            Ok(())
+        }
+    }
+
+    fn team325() -> Fake325 {
+        Fake325 {
+            inner: team(),
+            ..Fake325::default()
+        }
+    }
+
+    /// The teammate command of the 2.1.325 fixtures, short form (the full
+    /// fixtures and the parser's tests are in `teammate.rs`).
+    const TEAMMATE: &str = "cd /home/dev/demo && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS= /home/dev/.local/bin/claude --agent-id researcher@demo --agent-name researcher --team-name demo --agent-color blue --parent-session-id 0b9f6c1e-2a67-4c58-9d0e-6f4f8a1d2c33 --permission-mode acceptEdits";
+
+    #[test]
+    fn the_2_1_325_split_asks_for_a_placeholder_not_for_cat() {
+        // First teammate: the lead's own pane, a 70 % column. Every 2.1.325
+        // call leads with `-S <socket>`, the first field of `$TMUX`.
+        let v = parse(&a(
+            "-S addr split-window -d -t %3 -h -l 70% -P -F #{pane_id} -- cat",
+        ));
+        let mut b = team325();
+        let out = run(v, &mut b, HOST);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert_eq!(out.stdout, "%201\n");
+        assert_eq!(b.held, vec![(false, Some(3), Some("70%".to_string()))]);
+        assert!(b.inner.spawned.is_empty(), "no pane was asked to run cat");
+        // A later one: the middle teammate's pane, no size.
+        let v = parse(&a(
+            "-S addr split-window -d -t %201 -v -P -F #{pane_id} -- cat",
+        ));
+        assert_eq!(run(v, &mut b, HOST).stdout, "%202\n");
+        assert_eq!(b.held[1], (false, Some(201), None));
+        // The placeholders count in the window the lead lists.
+        let v = parse(&a("-S addr list-panes -t @0 -F #{pane_id}"));
+        assert_eq!(run(v, &mut b, HOST).stdout, "%3\n%4\n%201\n%202\n");
+    }
+
+    #[test]
+    fn only_the_bare_word_on_a_split_is_a_placeholder() {
+        let mut b = team325();
+        // `cat` with an argument is a command, and so is `cat` in a new window.
+        run(parse(&a("split-window -- cat notes.txt")), &mut b, HOST);
+        run(parse(&a("new-window -n x -- cat")), &mut b, HOST);
+        run(parse(&a("split-window -- /bin/cat")), &mut b, HOST);
+        assert!(b.held.is_empty());
+        assert_eq!(b.inner.spawned.len(), 3);
+        assert_eq!(b.inner.spawned[0].argv, ["cat", "notes.txt"]);
+        assert_eq!(b.inner.spawned[1].argv, ["cat"]);
+        assert!(!b.inner.spawned[1].here);
+        // A host that predates `hold` is asked to spawn the word, as before.
+        let mut old = team();
+        run(parse(&a("split-window -d -t %3 -- cat")), &mut old, HOST);
+        assert_eq!(old.spawned[0].argv, ["cat"]);
+        assert!(old.spawned[0].here);
+        assert_eq!(old.spawned[0].role, None);
+    }
+
+    fn respawn_args(target: &str, command: &str) -> Vec<String> {
+        let mut args = a(&format!("-S addr respawn-pane -k -t {target} --"));
+        args.push(command.to_string());
+        args
+    }
+
+    #[test]
+    fn respawn_pane_hands_the_command_string_to_the_broker_untouched() {
+        let v = parse(&respawn_args("%201", TEAMMATE));
+        assert_eq!(
+            v,
+            Verb::RespawnPane {
+                target: Target::Pane(201),
+                kill: true,
+                command: TEAMMATE.to_string(),
+            }
+        );
+        assert!(needs_broker(&v));
+        let mut b = team325();
+        let out = run(v, &mut b, HOST);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(out.stdout.is_empty());
+        assert_eq!(b.respawned, vec![(201, TEAMMATE.to_string())]);
+        // And the string is one the parser takes.
+        let c = parse_teammate_command(&b.respawned[0].1).unwrap();
+        assert_eq!(c.cwd, "/home/dev/demo");
+        assert_eq!(agent_name(&c.argv).as_deref(), Some("researcher"));
+    }
+
+    #[test]
+    fn respawn_pane_needs_a_pane_and_exactly_one_command_string() {
+        let mut b = team325();
+        for args in [
+            a("respawn-pane -k -- cat"),
+            a("respawn-pane -k -t %201"),
+            a("respawn-pane -k -t %201 -- claude --agent-id x"),
+            respawn_args("@0", TEAMMATE),
+        ] {
+            let out = run(parse(&args), &mut b, HOST);
+            assert_eq!(out.code, 1, "{args:?}");
+            assert!(out.stderr.starts_with("respawn-pane:"), "{}", out.stderr);
+        }
+        assert!(b.respawned.is_empty());
+        // A host that has not opted in refuses, and says so.
+        let out = run(parse(&respawn_args("%4", TEAMMATE)), &mut team(), HOST);
+        assert_eq!(out.code, 1);
+        assert!(out.stderr.contains("does not respawn"), "{}", out.stderr);
+        // The broker's own refusal is what the caller reads.
+        struct Refuses(Fake);
+        impl Broker for Refuses {
+            fn caller(&self) -> Option<usize> {
+                self.0.caller
+            }
+            fn list(&mut self) -> Result<Vec<Node>, String> {
+                self.0.list()
+            }
+            fn spawn(
+                &mut self,
+                _: bool,
+                _: bool,
+                _: Option<usize>,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &[String],
+            ) -> Result<usize, String> {
+                Err("no".to_string())
+            }
+            fn kill(&mut self, _: usize) -> Result<(), String> {
+                Err("no".to_string())
+            }
+            fn send(&mut self, _: usize, _: &str) -> Result<(), String> {
+                Err("no".to_string())
+            }
+            fn respawn(&mut self, _: usize, _: &str) -> Result<(), String> {
+                Err("pane 4 is not a placeholder of yours".to_string())
+            }
+        }
+        let out = run(
+            parse(&respawn_args("%4", TEAMMATE)),
+            &mut Refuses(team()),
+            HOST,
+        );
+        assert_eq!(
+            out.stderr,
+            "respawn-pane: pane 4 is not a placeholder of yours"
+        );
+    }
+
+    #[test]
+    fn the_2_1_325_option_calls_are_accepted_behind_a_socket_flag() {
+        // `-S <socket>` and `-L <name>` take a value and are skipped; what
+        // follows is the verb. Each of these exits 0 and prints nothing.
+        for args in [
+            a("-S addr set-option -p -t %201 window-style bg=default,fg=blue"),
+            a("-S addr set-option -p -t %201 pane-border-style fg=blue"),
+            a("-S addr set-option -p -t %201 pane-active-border-style fg=blue"),
+            a("-S addr select-pane -t %201 -T researcher"),
+            {
+                let mut v = a("-S addr set-option -p -t %201 pane-border-format");
+                v.push("#[fg=blue,bold] #{pane_title} #[default]".to_string());
+                v
+            },
+            a("-S addr set-option -w -t @0 pane-border-status top"),
+            a("-S addr select-layout -t @0 main-vertical"),
+            a("-S addr resize-pane -t %3 -x 30%"),
+            a("-S addr set-option -p -t %201 remain-on-exit failed"),
+            a("-L claude-swarm-4242 has-session -t claude-swarm"),
+        ] {
+            let v = parse(&args);
+            assert!(matches!(v, Verb::Accept(_)), "{args:?}: {v:?}");
+            assert!(!needs_broker(&v));
+            let out = run(v, &mut NoBroker, HOST);
+            assert_eq!(out.code, 0, "{args:?}: {}", out.stderr);
+            assert!(out.stdout.is_empty(), "{args:?}");
+        }
+        // The reads and the kill behind the same flag.
+        let mut b = team325();
+        let v = parse(&a("-S addr display-message -t %3 -p #{window_id}"));
+        assert_eq!(run(v, &mut b, HOST).stdout, "@0\n");
+        let v = parse(&a("-S addr display-message -p #{pane_id}"));
+        assert_eq!(run(v, &mut b, HOST).stdout, "%3\n");
+        let v = parse(&a("-L name list-panes -t @0 -F #{pane_id}"));
+        assert_eq!(run(v, &mut b, HOST).stdout, "%3\n%4\n");
+        assert_eq!(
+            run(parse(&a("-S addr kill-pane -t %4")), &mut b, HOST).code,
+            0
+        );
+        assert_eq!(b.inner.killed, vec![4]);
+        // A socket path that looks like a verb is still the flag's value.
+        assert_eq!(parse(&a("-S kill-pane -V")), Verb::Version);
     }
 }

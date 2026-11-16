@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-15
+
+### Added
+- **Claude Code 2.1.325's teammate launch is served.** That release no longer
+  passes the teammate's command on the split. It splits with the placeholder
+  `cat`, styles the pane, then sends
+  `respawn-pane -k -t %N -- '<one shell command line>'`. Read from the
+  installed 2.1.325 binary; no live lead was run against this crate.
+  - `Verb::RespawnPane { target, kill, command }`, parsed from
+    `respawn-pane` / `respawnp` (a pane target and exactly one argument after
+    `--`), and `Broker::respawn(id, command)`, which gets the command line
+    untouched. The method has a default that refuses, so an existing `Broker`
+    compiles unchanged and serves nothing new until it opts in.
+  - `PLACEHOLDER` (`"cat"`) and `Broker::hold(focus, beside, size)`: a
+    `split-window` whose whole command is that word asks the host for a pane
+    that holds its place. The default calls `spawn` with `["cat"]`, which is
+    what the split did before.
+  - `parse_teammate_command` and `TeammateCommand { cwd, env, argv }`: the
+    command line read without a shell. One grammar,
+    `cd <word> && env <NAME=word>* <word>+`, with the Linux tool-cgroup prefix
+    (`CGROUP_PREFIX`) recognised and dropped, POSIX quoting for words, and an
+    error with a reason for anything a shell would act on outside a quote
+    (`;`, `|`, `&`, `$`, a backquote, `(`, `)`, `<`, `>`, `*`, `?`, `[`, `{`,
+    `~`, `#`, `!`, a second `&&`), for any control character, and for input
+    over `MAX_COMMAND_BYTES`.
+- Tests pin the 2.1.325 strings as fixtures, `-S <socket>` / `-L <name>`
+  before every verb, and `set-option -p -t %N remain-on-exit failed` among the
+  accepted no-ops.
+
+A `match` on `Verb` with no wildcard arm needs one for `RespawnPane`. The
+version stays on 0.3 so that a host taking the crate by path under a `0.3`
+requirement keeps building.
+
 ## [0.3.0] - 2026-11-08
 
 ### Changed
